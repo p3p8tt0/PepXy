@@ -43,6 +43,12 @@ class DLStreamsExtractor:
         self._browser = None
         self._browser_launch_lock = asyncio.Lock()
         self._captured_cookies: list[dict] = []
+        # Proactive refresh tracking
+        self._last_session_refresh: dict[str, float] = {}
+        self._refresh_tasks: dict[str, asyncio.Task] = {}
+        self._dynamic_refresh_interval: dict[str, float] = {}
+        # Manifest micro-cache to handle rapid requests
+        self._manifest_cache: dict[str, tuple[str, float]] = {}
 
     def _get_browser_lock(self, channel_key: str) -> asyncio.Lock:
         lock = self._browser_channel_locks.get(channel_key)
@@ -314,6 +320,31 @@ class DLStreamsExtractor:
                         self._mark_browser_failure(channel_key)
 
                     self._captured_cookies = await context.cookies()
+                    
+                    # Log cookie expirations and calculate dynamic refresh interval
+                    min_expiry_remaining = 3600.0  # Default 1 hour fallback
+                    found_expiring_cookie = False
+
+                    for cookie in self._captured_cookies:
+                        expiry = cookie.get('expires', -1)
+                        if expiry != -1:
+                            remaining = expiry - time.time()
+                            # Only consider cookies that expire in the near-ish future (less than 1 week)
+                            # extremely long-lived ones are likely tracking IDs
+                            if 0 < remaining < 604800: 
+                                if not found_expiring_cookie or remaining < min_expiry_remaining:
+                                    min_expiry_remaining = remaining
+                                    found_expiring_cookie = True
+                            
+                            logger.info(f"🍪 Cookie captured: {cookie['name']} (Domain: {cookie['domain']}) - Expires in: {remaining/3600:.2f} hours")
+                        else:
+                            logger.info(f"🍪 Cookie captured: {cookie['name']} (Domain: {cookie['domain']}) - Session cookie")
+
+                    # Calculate adaptive interval: 80% of shortest lifespan, capped between 2m and 1h
+                    adaptive_interval = max(120, min(3600, min_expiry_remaining * 0.8))
+                    self._dynamic_refresh_interval[channel_key] = adaptive_interval
+                    logger.info(f"🔄 Dynamic refresh interval for {channel_key} set to {adaptive_interval/60:.2f} minutes")
+
                     # Sync cookies to session
                     if self.session:
                         yarl_url = URL(resolved_player_url)
@@ -321,6 +352,7 @@ class DLStreamsExtractor:
                             self.session.cookie_jar.update_cookies({cookie['name']: cookie['value']}, response_url=yarl_url)
 
                     logger.info("DLStreams browser session capture completed for %s", channel_key)
+                    self._last_session_refresh[channel_key] = time.time()
                     return manifest_text
                 finally:
                     await context.close()
@@ -383,11 +415,41 @@ class DLStreamsExtractor:
                 for c in self._captured_cookies:
                     session.cookie_jar.update_cookies({c['name']: c['value']}, response_url=yarl_url)
             
+            # 1. CHECK MICRO-CACHE (3s)
+            cached_item = self._manifest_cache.get(channel_key)
+            if cached_item and (time.time() - cached_item[1] < 3):
+                logger.debug("DLStreams manifest returned from micro-cache for %s", channel_key)
+                return {
+                    "destination_url": m3u8_url,
+                    "request_headers": playback_headers,
+                    "mediaflow_endpoint": self.mediaflow_endpoint,
+                    "captured_manifest": cached_item[0],
+                }
+
+            # 2. PROACTIVE BACKGROUND REFRESH
+            # Use dynamic interval based on cookie expiration (fallback to 15m if not set yet)
+            last_refresh = self._last_session_refresh.get(channel_key, 0)
+            refresh_threshold = self._dynamic_refresh_interval.get(channel_key, 900)
+            
+            if last_refresh > 0 and (time.time() - last_refresh > refresh_threshold):
+                if channel_key not in self._refresh_tasks or self._refresh_tasks[channel_key].done():
+                    logger.info("DLStreams spawning proactive background refresh for %s (threshold: %.1fm)", 
+                                channel_key, refresh_threshold / 60)
+                    # We use a wrapper to ensure the task is cleaned up
+                    async def do_refresh():
+                        try:
+                            await self._capture_browser_session_state(channel_id)
+                        except Exception as e:
+                            logger.error("DLStreams background refresh failed: %s", e)
+                    
+                    self._refresh_tasks[channel_key] = asyncio.create_task(do_refresh())
+
+            # 3. FETCH ACTUAL MANIFEST
             # Initial direct fetch attempt
             captured_manifest = await self._fetch_manifest_directly(m3u8_url, playback_headers)
             
             if not captured_manifest:
-                # If direct fetch fails, we need to re-capture session state via browser
+                # If direct fetch fails, we need to re-capture session state via browser (synchronous fallback)
                 logger.info("DLStreams direct fetch failed or session expired. Refreshing via browser...")
                 player_urls = self._prioritize_player_urls(channel_id)
                 for candidate in player_urls:
@@ -401,6 +463,9 @@ class DLStreamsExtractor:
             
             if not captured_manifest:
                 raise ExtractorError("Could not retrieve manifest after browser refresh.")
+            
+            # Update micro-cache
+            self._manifest_cache[channel_key] = (captured_manifest, time.time())
 
             # 2. SERVER LOOKUP: Refresh dynamic server_key
             lookup_url = f"{lookup_base}/server_lookup?channel_id={channel_key}"
