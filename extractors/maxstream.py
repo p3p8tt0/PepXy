@@ -59,40 +59,60 @@ class MaxstreamExtractor:
         async with session.get(maxstream_url, headers={"accept-language": "en-US,en;q=0.5"}) as response:
             text = await response.text()
 
-        # Extract and decode URL
+        # Try direct extraction first
+        direct_match = re.search(r'sources:\s*\[\{src:\s*"([^"]+)"', text)
+        if direct_match:
+            final_url = direct_match.group(1)
+            logger.info(f"Successfully extracted direct MaxStream URL: {final_url}")
+            self.base_headers["referer"] = url
+            return {
+                "destination_url": final_url,
+                "request_headers": self.base_headers,
+                "mediaflow_endpoint": self.mediaflow_endpoint,
+            }
+
+        # Fallback to packer logic
         match = re.search(r"\}\('(.+)',.+,'(.+)'\.split", text)
         if not match:
+            # Maybe it's a different packer signature?
+            match = re.search(r"eval\(function\(p,a,c,k,e,d\).+?\}\('(.+?)',.+?,'(.+?)'\.split", text, re.S)
+            
+        if not match:
+            logger.error(f"Failed to find packer script or direct source in: {text[:500]}...")
             raise ExtractorError("Failed to extract URL components")
 
         s1 = match.group(2)
         # Extract Terms
         terms = s1.split("|")
-        urlset_index = terms.index("urlset")
-        hls_index = terms.index("hls")
-        sources_index = terms.index("sources")
+        try:
+            urlset_index = terms.index("urlset")
+            hls_index = terms.index("hls")
+            sources_index = terms.index("sources")
+        except ValueError as e:
+            logger.error(f"Required terms missing in packer: {e}")
+            raise ExtractorError(f"Missing components in packer: {e}")
+
         result = terms[urlset_index + 1 : hls_index]
         reversed_elements = result[::-1]
-        first_part = terms[hls_index + 1 : sources_index]
-        reversed_first_part = first_part[::-1]
+        first_part_terms = terms[hls_index + 1 : sources_index]
+        reversed_first_part = first_part_terms[::-1]
+        
         first_url_part = ""
-        for first_part in reversed_first_part:
-            if "0" in first_part:
-                first_url_part += first_part
+        for fp in reversed_first_part:
+            if "0" in fp:
+                first_url_part += fp
             else:
-                first_url_part += first_part + "-"
+                first_url_part += fp + "-"
 
-        base_url = f"https://{first_url_part}.host-cdn.net/hls/"
+        base_url = f"https://{first_url_part.rstrip('-')}.host-cdn.net/hls/"
+        
         if len(reversed_elements) == 1:
             final_url = base_url + "," + reversed_elements[0] + ".urlset/master.m3u8"
-        lenght = len(reversed_elements)
-        i = 1
-        for element in reversed_elements:
-            base_url += element + ","
-            if lenght == i:
-                base_url += ".urlset/master.m3u8"
-            else:
-                i += 1
-        final_url = base_url
+        else:
+            final_url = base_url
+            for i, element in enumerate(reversed_elements):
+                final_url += element + ","
+            final_url = final_url.rstrip(",") + ".urlset/master.m3u8"
 
         self.base_headers["referer"] = url
         return {
