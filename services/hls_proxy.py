@@ -2300,8 +2300,9 @@ class HLSProxy:
                 logger.info(
                     f"📡 [Proxy Stream] {routing} - Using session{f' via proxy {session_proxy}' if session_proxy else ' (direct)'} for: {stream_url}"
                 )
-            # ✅ TLS FINGERPRINT BYPASS: Use curl_cffi for problematic CDNs (CinemaCity)
-            use_curl_cffi = HAS_CURL_CFFI and any(d in stream_url for d in ["cccdn.net", "cinemacity.cc"])
+            # ✅ TLS FINGERPRINT BYPASS: Use curl_cffi for problematic CDNs (CinemaCity, Mediahubmx)
+            is_mediahub_dynamic = "/sunshine/" in stream_url.lower() or ".ngolp" in stream_url.lower()
+            use_curl_cffi = HAS_CURL_CFFI and (is_mediahub_dynamic or any(d in stream_url for d in ["cccdn.net", "cinemacity.cc"]))
             
             if use_curl_cffi:
                 curl_proxy = f"{request.scheme}://{session_proxy}" if session_proxy else None
