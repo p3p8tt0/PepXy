@@ -365,20 +365,49 @@ class ManifestRewriter:
                     f"{proxy_base}/proxy/hls/manifest.m3u8?d={encoded_variant_url}{header_params}"
                 )
 
+            proxied_media_lines = []
+            for line in lines:
+                if not line.startswith("#EXT-X-MEDIA:") or 'URI="' not in line:
+                    continue
+
+                uri_start = line.find('URI="') + 5
+                uri_end = line.find('"', uri_start)
+                if uri_start <= 4 or uri_end <= uri_start:
+                    proxied_media_lines.append(line.strip())
+                    continue
+
+                media_url = urljoin(base_url, line[uri_start:uri_end])
+                if shorten_url_func:
+                    url_id = await shorten_url_func(media_url)
+                    proxy_media_url = f"{proxy_base}/proxy/hls/manifest.m3u8?hls_url_id={url_id}{header_params}"
+                else:
+                    encoded_media_url = urllib.parse.quote(media_url, safe="")
+                    proxy_media_url = (
+                        f"{proxy_base}/proxy/hls/manifest.m3u8?d={encoded_media_url}{header_params}"
+                    )
+                proxied_media_lines.append(line[:uri_start] + proxy_media_url + line[uri_end:])
+
+            rewritten_lines.append("#EXTM3U")
             skip_next_url = False
             for i, line in enumerate(lines):
+                stripped = line.strip()
                 if skip_next_url:
                     skip_next_url = False
                     continue
                 if i == highest_quality_stream["index"]:
-                    rewritten_lines.append(line.strip())
-                    rewritten_lines.append(proxy_variant_url)
-                    skip_next_url = True
                     continue
                 if any(stream["index"] == i for stream in generic_streams):
                     skip_next_url = True
                     continue
-                rewritten_lines.append(line.strip())
+                if stripped.startswith("#EXT-X-MEDIA:"):
+                    continue
+                if stripped == "#EXTM3U":
+                    continue
+                rewritten_lines.append(stripped)
+
+            rewritten_lines.extend([line for line in proxied_media_lines if line])
+            rewritten_lines.append(highest_quality_stream["inf"])
+            rewritten_lines.append(proxy_variant_url)
 
             return "\n".join(rewritten_lines)
 
