@@ -2273,6 +2273,7 @@ class HLSProxy:
         """✅ NUOVO: Proxy dedicato per segmenti .ts con Content-Disposition"""
         try:
             headers = dict(stream_headers)
+            is_cccdn_stream = "cccdn.net" in segment_url
 
             def set_response_header(target: dict, name: str, value: str):
                 keys_to_remove = [k for k in target.keys() if k.lower() == name.lower()]
@@ -2284,6 +2285,9 @@ class HLSProxy:
             for header in ["range", "if-none-match", "if-modified-since"]:
                 if header in request.headers:
                     headers[header] = request.headers[header]
+
+            if is_cccdn_stream:
+                headers["Accept-Encoding"] = "identity"
 
             # ✅ Use pooled session for better performance
             session, _ = await self._get_proxy_session(segment_url)
@@ -2418,6 +2422,9 @@ class HLSProxy:
             # ✅ NUOVO: Determina se disabilitare SSL per questo dominio
             disable_ssl = get_ssl_setting_for_url(stream_url, TRANSPORT_ROUTES)
             is_cccdn_stream = "cccdn.net" in stream_url
+
+            if is_cccdn_stream:
+                headers["Accept-Encoding"] = "identity"
 
             def _cookie_summary(value: str | None) -> str:
                 if not value:
