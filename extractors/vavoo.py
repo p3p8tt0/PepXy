@@ -274,6 +274,8 @@ class VavooExtractor:
                 "referer": "https://vavoo.to/",
             }
 
+        stream_headers["X-EasyProxy-Disable-SSL"] = "1"
+
         return {
             "destination_url": resolved_url,
             "request_headers": stream_headers,

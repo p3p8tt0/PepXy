@@ -171,7 +171,19 @@ def get_solver_proxy_url(proxy_url: str | None) -> str | None:
 def get_ssl_setting_for_url(url: str, transport_routes: list) -> bool:
     """Determina se SSL deve essere disabilitato per un URL basato su TRANSPORT_ROUTES."""
     if not url or not transport_routes:
-        return False
+        normalized_url = (url or "").lower()
+        return any(
+            domain in normalized_url
+            for domain in ("vavoo.to", "vavoo.tv", "lokke.app", "mediahubmx")
+        )
+
+    normalized_url = url.lower()
+
+    if any(
+        domain in normalized_url
+        for domain in ("vavoo.to", "vavoo.tv", "lokke.app", "mediahubmx")
+    ):
+        return True
 
     for route in transport_routes:
         url_pattern = route["url"]
@@ -229,7 +241,7 @@ MAX_RECORDING_DURATION = int(os.environ.get("MAX_RECORDING_DURATION", 28800))
 RECORDINGS_RETENTION_DAYS = int(os.environ.get("RECORDINGS_RETENTION_DAYS", 7))
 
 # --- Version/Mode Configuration ---
-APP_VERSION = "2.5.77"
+APP_VERSION = "2.5.78"
 
 _has_solvers = os.path.exists("flaresolverr") and (
     os.path.exists("byparr") or os.path.exists("byparr_src")

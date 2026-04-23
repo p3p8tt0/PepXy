@@ -1345,6 +1345,7 @@ class HLSProxy:
                         "icy-metadata",
                         "accept-encoding",
                         "content-length",
+                        "x-easyproxy-disable-ssl",
                     }:
                         continue
                     stream_headers[header_name] = header_value
@@ -1369,6 +1370,7 @@ class HLSProxy:
                 stream_headers = result.get("request_headers", {})
                 captured_manifest = result.get("captured_manifest")
                 warp_bypass = result.get("warp_bypass", False)
+                force_disable_ssl = result.get("disable_ssl", False)
 
                 # Se l'estrattore richiede il bypass di WARP, aggiungiamo il flag all'URL
                 if warp_bypass:
@@ -2523,7 +2525,14 @@ class HLSProxy:
             # logger.info(f"   Final Stream Headers: {headers}")
 
             # ✅ NUOVO: Determina se disabilitare SSL per questo dominio
-            disable_ssl = get_ssl_setting_for_url(stream_url, TRANSPORT_ROUTES)
+            disable_ssl = (
+                request.query.get("h_X-EasyProxy-Disable-SSL") == "1"
+                or request.query.get("disable_ssl") == "1"
+                or headers.get("X-EasyProxy-Disable-SSL") == "1"
+                or get_ssl_setting_for_url(stream_url, TRANSPORT_ROUTES)
+            )
+            headers.pop("X-EasyProxy-Disable-SSL", None)
+            headers.pop("x-easyproxy-disable-ssl", None)
             is_cccdn_stream = "cccdn.net" in stream_url
 
             if is_cccdn_stream:

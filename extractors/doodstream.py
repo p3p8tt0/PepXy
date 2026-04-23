@@ -113,15 +113,18 @@ class DoodStreamExtractor:
         html = solution.get("response", "")
         ua = solution.get("userAgent", _DOOD_UA)
         raw_cookies = solution.get("cookies", [])
-
+        cookies = {}
         if raw_cookies:
             cookies = {c["name"]: c["value"] for c in raw_cookies}
             self.cache.set(urlparse(url).netloc, cookies, ua)
 
         if "pass_md5" not in html:
+             if any(x in html.lower() for x in ["video not found", "video non trovato", "removed", "eliminato", "not found"]):
+                 raise ExtractorError("DoodStream: Video not found (deleted or invalid URL)")
+             logger.error(f"DoodStream: Byparr returned HTML without pass_md5. Snippet: {html[:500]}...")
              raise ExtractorError("DoodStream: Byparr failed to solve the challenge correctly (pass_md5 not found)")
 
-        return await self._parse_embed_html(html, base_url, ua, use_byparr=True)
+        return await self._parse_embed_html(html, base_url, ua, use_byparr=True, cookies=cookies)
 
     async def _extract_via_curl_cffi(self, url: str, video_id: str, cookies: dict = None, ua: str = None) -> dict:
         proxy = self._get_proxy(url)
@@ -145,9 +148,9 @@ class DoodStreamExtractor:
                     return await self._extract_via_byparr(url, video_id)
             raise ExtractorError(f"DoodStream: pass_md5 not found")
 
-        return await self._parse_embed_html(html, base_url, current_ua)
+        return await self._parse_embed_html(html, base_url, current_ua, cookies=cookies)
 
-    async def _parse_embed_html(self, html: str, base_url: str, override_ua: str = None, use_byparr: bool = False) -> dict:
+    async def _parse_embed_html(self, html: str, base_url: str, override_ua: str = None, use_byparr: bool = False, cookies: dict = None) -> dict:
         pass_match = re.search(r"(/pass_md5/[^'\"<>\s]+)", html)
         if not pass_match:
             raise ExtractorError("DoodStream: pass_md5 path not found")
@@ -157,7 +160,7 @@ class DoodStreamExtractor:
         
         headers = {
             "User-Agent": ua,
-            "Referer": "https://doodstream.com/",
+            "Referer": f"{base_url}/",
             "Accept": "*/*",
             "Connection": "keep-alive",
         }
@@ -174,6 +177,7 @@ class DoodStreamExtractor:
                     pass_url,
                     impersonate="chrome",
                     headers=headers,
+                    cookies=cookies or {},
                     timeout=20,
                     **({"proxy": proxy} if proxy else {}),
                 )
