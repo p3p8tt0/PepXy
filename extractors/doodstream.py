@@ -32,7 +32,7 @@ _DOOD_UA = (
 )
 _FREE_SOCKS5_URL = os.environ.get(
     "DOOD_FREE_PROXY_URL",
-    "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/protocols/socks5/data.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/all/data.txt",
 )
 _FREE_PROXY_ENABLED = os.environ.get("DOOD_ENABLE_FREE_PROXY_POOL", "true").lower() == "true"
 _FREE_PROXY_CACHE_TTL = int(os.environ.get("DOOD_FREE_PROXY_CACHE_TTL", "1800"))
