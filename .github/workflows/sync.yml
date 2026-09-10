@@ -1,15 +1,24 @@
-name: Auto-Sync Fork
+name: Deploy to Koyeb
 
 on:
-  schedule:
-    - cron: '0 2 * * *' # Cerca aggiornamenti ogni notte alle 2:00
-  workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
-  sync:
+  deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Sincronizza il fork con l'originale
-        run: gh repo sync $GITHUB_REPOSITORY
+      - name: Checkout codice
+        uses: actions/checkout@v4
+
+      - name: Installa Koyeb CLI
+        run: |
+          curl -fsSL https://app.koyeb.com/install.sh | sh
+          echo "$HOME/.koyeb/bin" >> $GITHUB_PATH
+
+      - name: Redeploy Servizio
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
+        run: |
+          koyeb service redeploy 905acb8a-258c-4f6b-a85f-406344473ad9?deploymentId=29f79dfe-00c2-4585-9200-c1dc59d191e8
