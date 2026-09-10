@@ -1,4 +1,4 @@
-name: Deploy to Koyeb
+name: Sync to Koyeb
 
 on:
   push:
@@ -6,19 +6,14 @@ on:
       - main
 
 jobs:
-  deploy:
+  sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout codice
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Installa Koyeb CLI
-        run: |
-          curl -fsSL https://app.koyeb.com/install.sh | sh
-          echo "$HOME/.koyeb/bin" >> $GITHUB_PATH
-
-      - name: Redeploy Servizio
-        env:
-          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
-        run: |
-          koyeb service redeploy 905acb8a-258c-4f6b-a85f-406344473ad9?deploymentId=29f79dfe-00c2-4585-9200-c1dc59d191e8
+      - name: Sync and Redeploy to Koyeb
+        uses: koyeb/action-koyeb@v1
+        with:
+          api_token: ${{ secrets.KOYEB_TOKEN }}
+          service_id: 905acb8a-258c-4f6b-a85f-406344473ad9?deploymentId=29f79dfe-00c2-4585-9200-c1dc59d191e8
