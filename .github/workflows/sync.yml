@@ -1,19 +1,28 @@
-name: Sync to Koyeb
+name: Sync fork with upstream
 
 on:
-  push:
-    branches:
-      - main
+  schedule:
+    - cron: '*/15 * * * *'   # ogni 15 minuti, personalizzabile
+  workflow_dispatch:          # permette anche l'avvio manuale
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Checkout repository
+      - name: Checkout fork
         uses: actions/checkout@v4
-
-      - name: Sync and Redeploy to Koyeb
-        uses: koyeb/action-koyeb@v1
         with:
-          api_token: ${{ secrets.KOYEB_TOKEN }}
-          service_id: 905acb8a-258c-4f6b-a85f-406344473ad9?deploymentId=29f79dfe-00c2-4585-9200-c1dc59d191e8
+          fetch-depth: 0
+          ref: main   # cambia col nome del tuo branch principale
+
+      - name: Aggiungi remote upstream
+        run: |
+          git remote add upstream https://github.com/realbestia1/EasyProxy
+          git fetch upstream
+
+      - name: Merge upstream nel fork
+        run: |
+          git merge upstream/main --no-edit
+          git push origin main
