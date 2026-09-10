@@ -1,0 +1,15 @@
+name: Auto-Sync Fork
+
+on:
+  schedule:
+    - cron: '0 2 * * *' # Cerca aggiornamenti ogni notte alle 2:00
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sincronizza il fork con l'originale
+        run: gh repo sync $GITHUB_REPOSITORY
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
