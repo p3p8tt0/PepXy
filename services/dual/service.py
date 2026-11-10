@@ -200,24 +200,30 @@ async def prepare_audio(request: web.Request) -> web.Response:
     return _json(await prepare_audio_data(body, request))
 
 
-async def cached_audio(request: web.Request) -> web.Response:
-    body = await _json_body(request)
-    token = _require_session(request, body)
-    hid = audio.find_cached(str(body.get("mediaKey") or ""), str(body.get("lang") or "").lower())
-    if not hid:
-        raise DualServiceError(404, "valid cached audio track not found")
-    metadata = audio.metadata(hid)
-    return _json({
-        "url": _audio_url(request, hid, token),
-        "cached": True,
-        "hid": hid,
-        "audio_fingerprint": metadata.get("source_fingerprint", ""),
-    })
 
 
 async def cache_status(request: web.Request) -> web.Response:
-    """Return real remote cache state for Toast Stream's manifest labels."""
+    """Return remote cache state for Toast Stream's manifest labels.
+
+    Sending the dual descriptor (``d=``, the same one the manifest call uses)
+    makes the answer exact: the video/audio identity is resolved and looked up,
+    so ``cached`` means the stored measurement is really reusable.  Without it
+    the check stays video-level (any stored audio) and reports ``exact=false``.
+    """
     body = await _json_body(request)
+    descriptor = str(request.query.get("d") or body.get("d") or "").strip()
+    proxy = request.app.get("proxy") if request.app is not None else None
+    if descriptor and proxy is not None:
+        result = await proxy.dual_cache_status({**body, "d": descriptor})
+        return _json({
+            "offset": {
+                "cached": bool(result.get("cached")),
+                "status": result.get("status"),
+                "updated_at": result.get("updated_at"),
+            },
+            "exact": bool(result.get("exact")),
+        })
+
     media_key = str(body.get("mediaKey") or body.get("media_key") or "")
     try:
         resolution = int(body.get("resolution") or 0)
@@ -238,11 +244,7 @@ async def cache_status(request: web.Request) -> web.Response:
             "status": offset.get("status") if offset else None,
             "updated_at": offset.get("updated_at") if offset else None,
         },
-        "video": {
-            "cached": False,
-            "persistent": False,
-            "mode": "direct",
-        },
+        "exact": False,
     })
 
 
@@ -267,6 +269,14 @@ async def audio_playlist(request: web.Request) -> web.Response:
             "#EXT-X-MEDIA-SEQUENCE:0",
             f'#EXT-X-MAP:URI="{base}/dual/aud/{hid}/init.mp4?{_asset_query(request, offset_ms, rate_nano, token)}"',
         ]
+        lead = float(timeline[0]["start"])
+        if lead > AUDIO_GAP_MIN_SECONDS:
+            # Audio starts after the video: fill the head with silence so the
+            # playlist position matches the shifted media timestamps.
+            lines += [
+                f"#EXTINF:{lead:.6f},",
+                f"{base}/dual/aud/{hid}/gap.m4s?{_asset_query(request, offset_ms, rate_nano, token)}",
+            ]
         for item in timeline:
             query = _asset_query(request, offset_ms, rate_nano, token)
             lines += [
@@ -282,6 +292,37 @@ async def audio_playlist(request: web.Request) -> web.Response:
     except FileNotFoundError as exc:
         raise DualServiceError(410, "audio session expired") from exc
     except ValueError as exc:
+        raise DualServiceError(404, str(exc)) from exc
+
+
+AUDIO_GAP_MIN_SECONDS = 0.05
+
+
+async def audio_gap(request: web.Request) -> web.Response:
+    hid = request.match_info["hid"]
+    _require_session(request)
+    offset_ms = _query_int(request, "o", 0)
+    rate_nano = _query_int(request, "r", 1_000_000_000)
+    try:
+        offset, rate = offset_ms / 1000.0, rate_nano / 1_000_000_000
+        timeline = audio.timeline(audio.metadata(hid), offset, rate)
+        if not timeline or float(timeline[0]["start"]) <= AUDIO_GAP_MIN_SECONDS:
+            raise ValueError("no audio lead-in gap")
+        data = await audio.gap_fragment(hid, offset, rate, float(timeline[0]["start"]))
+        return _audio_response(data, "video/iso.segment")
+    except FileNotFoundError as exc:
+        raise DualServiceError(410, "audio session expired") from exc
+    except asyncio.TimeoutError as exc:
+        raise DualServiceError(504, {
+            "code": "AUDIO_NETWORK_TIMEOUT",
+            "message": "audio upstream request timed out",
+        }) from exc
+    except AssetFetchError as exc:
+        raise DualServiceError(exc.status, {
+            "code": "AUDIO_NETWORK_ERROR",
+            "message": str(exc),
+        }) from exc
+    except (ValueError, RuntimeError) as exc:
         raise DualServiceError(404, str(exc)) from exc
 
 
@@ -459,22 +500,6 @@ async def subtitle_segment(request: web.Request) -> web.Response:
         raise DualServiceError(404, str(exc)) from exc
 
 
-async def offset_lookup(request: web.Request) -> web.Response:
-    body = await _json_body(request)
-    _require_session(request, body)
-    result = await offsets.lookup(body)
-    return _json({"found": bool(result), "offset": result})
-
-
-async def offset_report(request: web.Request) -> web.Response:
-    body = await _json_body(request)
-    _require_session(request, body)
-    result = body.get("offset")
-    if not isinstance(result, dict):
-        raise DualServiceError(400, "offset result required")
-    await offsets.report(body, result)
-    return _json({"ok": True})
-
 
 async def sync_audio(request: web.Request) -> web.Response:
     body = await _json_body(request)
@@ -607,6 +632,7 @@ def install(app: web.Application, cache_dir: str | Path) -> None:
     # service in-process; only its generated audio URLs remain public.
     app.router.add_get("/dual/aud/{hid}/audio.m3u8", audio_playlist)
     app.router.add_get("/dual/aud/{hid}/init.mp4", audio_init)
+    app.router.add_get("/dual/aud/{hid}/gap.m4s", audio_gap)
     app.router.add_get("/dual/aud/{hid}/s{idx:\\d+}.m4s", audio_segment)
     app.router.add_get("/dual/sub/{sid}/subtitles.m3u8", subtitle_playlist)
     app.router.add_get("/dual/sub/{sid}/init.mp4", subtitle_init)

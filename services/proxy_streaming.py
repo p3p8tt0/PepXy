@@ -6,9 +6,9 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 import aiohttp
 from services.dual.video import byte_range, video_only
-import config_store
+import services.dual.prefetch as dual_prefetch
 import config as _config
-from config import PROXY_SOURCE_LIST, find_first_alive_async, is_proxy_alive
+from config import is_proxy_alive
 import services.proxy_shared as _shared
 import services.wg_tunnels as wg_tunnels
 from services.proxy_shared import (
@@ -30,6 +30,7 @@ from services.proxy_shared import (
     ManifestRewriter,
     MPDToHLSConverter,
     parse_clearkey_params,
+    ProxyDeadRetryError,
     seal_clearkey,
     decrypt_segment,
     check_password,
@@ -37,7 +38,8 @@ from services.proxy_shared import (
     final_curl_request_url,
     should_use_curl_cffi,
     is_special_cdn_stream,
-    ProxyDeadRetryError,
+    host_needs_impersonation,
+    remember_impersonation_host,
     get_public_base_url,
     get_extractor_routing_overrides,
     request_log_context,
@@ -46,6 +48,10 @@ from services.proxy_shared import (
 
 class _ParallelFallback(Exception):
     """Raised when parallel range fetch is not applicable; falls back to single connection."""
+
+
+class _ClientDisconnected(Exception):
+    """The player left while the segment was still being fetched."""
 
 
 # Do not share asyncio's default executor with WARP/proxy socket health checks.
@@ -60,6 +66,11 @@ _CLEARKEY_EXECUTOR = ThreadPoolExecutor(
 # range requests. Only triggers for large segments on range-enabled CDNs.
 _PARALLEL_MIN_SIZE = 1_500_000  # 1.5 MB
 _PARALLEL_PARTS = 3
+
+# Proactive signed-token refresh: re-extract when a segment URL's e= deadline is
+# this close, with a cooldown so one refresh covers a whole token generation.
+_TOKEN_REFRESH_MARGIN_SECONDS = 15.0
+_TOKEN_REFRESH_COOLDOWN_SECONDS = 60.0
 
 
 class HLSProxyStreamingMixin:
@@ -79,6 +90,11 @@ class HLSProxyStreamingMixin:
 
     # Pre-compiled regex for segment URL parsing
     _SEGMENT_URL_PATTERN = re.compile(r"([-_])(\d+)(\.[^.]+)$")
+
+    @staticmethod
+    def _client_gone(request) -> bool:
+        transport = getattr(request, "transport", None)
+        return transport is not None and transport.is_closing()
 
     @staticmethod
     async def _write_with_backpressure(response, chunk, max_backlog=131072):
@@ -275,8 +291,12 @@ class HLSProxyStreamingMixin:
         client_range = headers.get("range") or headers.get("Range")
         if client_range and client_range.lower() != "bytes=0-":
             raise _ParallelFallback("client requested a partial range")
-        if is_special_cdn_stream(segment_url):
-            raise _ParallelFallback("special CDN")
+        if is_special_cdn_stream(segment_url) or should_use_curl_cffi(
+            segment_url, False, HAS_CURL_CFFI
+        ):
+            # Domains that need TLS impersonation (e.g. vidxgo's d2b.you) go
+            # straight to the single-connection curl_cffi path.
+            raise _ParallelFallback("single-connection transport preferred")
 
         base_headers = {k: v for k, v in headers.items() if k.lower() != "range"}
         disable_ssl = get_ssl_setting_for_url(segment_url) or check_vavoo_request(headers, request, segment_url)
@@ -295,7 +315,7 @@ class HLSProxyStreamingMixin:
                 yarl.URL(segment_url, encoded=True),
                 headers=probe_headers,
                 ssl=not disable_ssl,
-                timeout=ClientTimeout(total=15, connect=10, sock_connect=10, sock_read=15),
+                timeout=ClientTimeout(total=6, connect=5, sock_connect=5, sock_read=5),
             ) as probe:
                 if probe.status not in (200, 206):
                     raise _ParallelFallback(f"probe status {probe.status}")
@@ -329,6 +349,8 @@ class HLSProxyStreamingMixin:
 
         if not total or total < _PARALLEL_MIN_SIZE:
             raise _ParallelFallback(f"segment too small ({total})")
+        if self._client_gone(request):
+            return web.Response(status=499, text="Client disconnected")
 
         stats = getattr(self, "_parallel_fetch_stats", None)
         if stats is not None:
@@ -360,7 +382,7 @@ class HLSProxyStreamingMixin:
                     yarl.URL(segment_url, encoded=True),
                     headers=h,
                     ssl=not disable_ssl,
-                    timeout=ClientTimeout(total=60, connect=10, sock_connect=10, sock_read=60),
+                    timeout=ClientTimeout(total=45, connect=10, sock_connect=10, sock_read=10),
                 ) as r:
                     # A CDN ignoring Range answers 200 with the FULL body:
                     # writing it at an offset silently corrupts the segment
@@ -368,27 +390,63 @@ class HLSProxyStreamingMixin:
                     if r.status != 206:
                         raise _ParallelFallback(f"part {start}-{end} status {r.status}")
                     r.raise_for_status()
-                    part = await r.read()
-                    if len(part) != (end - start + 1):
+                    # Write chunks straight into the shared buffer: buffering the
+                    # whole part first (r.read()) kept ~2x the segment in RAM per
+                    # request, which is what inflated RSS at active_peak=4.
+                    expected = end - start + 1
+                    written = 0
+                    async for piece in r.content.iter_chunked(65536):
+                        if self._client_gone(request):
+                            raise _ClientDisconnected()
+                        if written + len(piece) > expected:
+                            raise _ParallelFallback(f"part {start}-{end} overlong")
+                        data[start + written:start + written + len(piece)] = piece
+                        written += len(piece)
+                    if written != expected:
                         raise _ParallelFallback(
-                            f"part {start}-{end} short ({len(part)} bytes)"
+                            f"part {start}-{end} short ({written} bytes)"
                         )
-                    data[start:start + len(part)] = part
             finally:
                 if s_proxy:
                     await s.close()
 
+        tasks = [asyncio.create_task(_fetch_part_into(s, e)) for s, e in ranges]
+
+        async def _watch_client():
+            while any(not task.done() for task in tasks):
+                if self._client_gone(request):
+                    for task in tasks:
+                        task.cancel()
+                    return
+                await asyncio.sleep(0.5)
+
+        watcher = asyncio.create_task(_watch_client())
         try:
-            await asyncio.gather(*[_fetch_part_into(s, e) for s, e in ranges])
-        except Exception as e:
-            raise _ParallelFallback(f"parallel fetch error: {e}")
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=10.0)
+        except asyncio.TimeoutError:
+            raise _ParallelFallback("parallel fetch budget exceeded")
+        except asyncio.CancelledError:
+            if self._client_gone(request):
+                return web.Response(status=499, text="Client disconnected")
+            raise
+        except BaseException as exc:
+            if isinstance(exc, _ClientDisconnected):
+                return web.Response(status=499, text="Client disconnected")
+            raise _ParallelFallback(f"parallel fetch error: {exc}") from exc
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            watcher.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         if len(data) != total:
             raise _ParallelFallback(f"size mismatch {len(data)} != {total}")
 
         # Safety net: content-type can lie. Never relay PNG/WEBP bytes as TS
         # (silent green screen, no log). Unwrap here, drop if not a valid TS.
-        raw = bytes(data)
+        # raw stays a bytearray: bytearray slicing/startswith are byte-compatible.
+        raw = data
         if self._is_image_magic(raw):
             logger.warning(
                 "Sniffed image-wrapped segment for %s in parallel fetch (%d bytes) -> unwrap",
@@ -417,22 +475,136 @@ class HLSProxyStreamingMixin:
         set_response_header(response_headers, "Access-Control-Allow-Origin", "*")
         set_response_header(response_headers, "Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
         set_response_header(response_headers, "Access-Control-Allow-Headers", "Range, Content-Type")
+        if self._client_gone(request):
+            return web.Response(status=499, text="Client disconnected")
         response = web.StreamResponse(status=200, headers=response_headers)
-        await response.prepare(request)
-        for i in range(0, len(raw), 65536):
-            await response.write(bytes(raw[i:i+65536]))
-        await response.write_eof()
+        try:
+            await response.prepare(request)
+            for i in range(0, len(raw), 65536):
+                if self._client_gone(request):
+                    return response
+                await response.write(bytes(raw[i:i+65536]))
+            await response.write_eof()
+        except (ConnectionResetError, OSError, RuntimeError) as exc:
+            logger.info("[INFO] Client disconnected from stream: %s (%s)", segment_url, exc)
+            return response if response.prepared else web.Response(status=499, text="Client disconnected")
         logger.info(f"⚡ Parallel fetch {segment_name}: {len(raw)} bytes via {K} ranges")
         return response
+
+    @staticmethod
+    def _segment_token_expiry(stream_url: str) -> float | None:
+        """Epoch seconds from a signed URL's e= parameter, if any."""
+        try:
+            query = urllib.parse.urlsplit(stream_url).query
+        except (TypeError, ValueError):
+            return None
+        values = urllib.parse.parse_qs(query).get("e")
+        if not values or not values[0].isdigit():
+            return None
+        value = int(values[0])
+        return value / 1000.0 if value > 10_000_000_000 else float(value)
+
+    @staticmethod
+    def _fresh_segment_url(refreshed: dict, seg_filename: str, stream_url: str) -> str | None:
+        """URL of the same segment inside a freshly extracted manifest."""
+        captured_manifests = dict((refreshed or {}).get("captured_manifests") or {})
+        master_url = (refreshed or {}).get("destination_url")
+        master_text = (refreshed or {}).get("captured_manifest")
+        if master_text and master_url:
+            captured_manifests.setdefault(master_url, master_text)
+        for m_url, m_text in captured_manifests.items():
+            for line in (m_text or "").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                abs_url = urllib.parse.urljoin(m_url, line)
+                if abs_url.rsplit("/", 1)[-1].split("?")[0] == seg_filename:
+                    return abs_url
+        # Tokenized HLS where only the playlist query changed.
+        if master_url and "?" in master_url:
+            return stream_url.split("?", 1)[0] + "?" + master_url.split("?", 1)[1]
+        return None
+
+    def _schedule_cdn_token_refresh(
+        self, orig_url, stream_url, headers, bypass_warp, forced_proxy, stream_key
+    ) -> None:
+        """Re-extract in the background before a signed segment URL expires."""
+        if not stream_key:
+            return
+        expiry = self._segment_token_expiry(stream_url)
+        now = time.time()
+        if expiry is None or expiry <= now or expiry - now > _TOKEN_REFRESH_MARGIN_SECONDS:
+            return
+        if now - getattr(self, "_renewed_cdn_token_atimes", {}).get(stream_key, 0.0) < _TOKEN_REFRESH_COOLDOWN_SECONDS:
+            return
+        tasks = getattr(self, "_cdn_refresh_tasks", None)
+        if tasks is None:
+            tasks = self._cdn_refresh_tasks = {}
+        existing = tasks.get(stream_key)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._refresh_cdn_token(
+                orig_url, stream_url, headers, bypass_warp, forced_proxy, stream_key
+            )
+        )
+        tasks[stream_key] = task
+
+        def _drop(_task, key=stream_key):
+            if tasks.get(key) is _task:
+                tasks.pop(key, None)
+
+        task.add_done_callback(_drop)
+
+    def _store_cdn_token(self, stream_key, old_url, new_url, label) -> None:
+        old_base_dir = old_url.rsplit("/", 1)[0] + "/"
+        new_base_dir = new_url.rsplit("/", 1)[0] + "/"
+        new_qs = "?" + new_url.split("?", 1)[1] if "?" in new_url else ""
+        self._renewed_cdn_tokens[stream_key] = (old_base_dir, new_base_dir, new_qs)
+        self._renewed_cdn_token_atimes[stream_key] = time.time()
+        logger.info("🔑 %s for stream_key=%s", label, stream_key[:8])
+
+    async def _extract_refreshed(self, orig_url, headers, bypass_warp, forced_proxy):
+        async with self.borrow_extractor(
+            orig_url, headers, bypass_warp=bypass_warp
+        ) as extractor:
+            return await extractor.extract(
+                orig_url,
+                force_refresh=True,
+                request_headers=headers,
+                bypass_warp=bypass_warp,
+                proxy=forced_proxy,
+            )
+
+    async def _refresh_cdn_token(
+        self, orig_url, stream_url, headers, bypass_warp, forced_proxy, stream_key
+    ) -> None:
+        if not orig_url:
+            return
+        try:
+            refreshed = await self._extract_refreshed(
+                orig_url, headers, bypass_warp, forced_proxy
+            )
+        except Exception as exc:
+            logger.debug("Proactive token refresh failed for %s: %s", stream_key[:8], exc)
+            return
+        if not refreshed:
+            return
+        seg_filename = stream_url.rsplit("/", 1)[-1].split("?")[0]
+        fresh_url = self._fresh_segment_url(refreshed, seg_filename, stream_url)
+        if not fresh_url:
+            return
+        self._store_cdn_token(
+            stream_key,
+            stream_url,
+            fresh_url,
+            f"Proactive CDN token refresh (segment {seg_filename})",
+        )
 
     async def _proxy_segment(self, request, segment_url, stream_headers, segment_name):
         """✅ NUOVO: Proxy dedicato per segmenti .ts con Content-Disposition"""
         forced_proxy = None
         try:
-            self._touch_extractor_activity(
-                request.query.get("extractor_key"),
-                request.query.get("stream_key"),
-            )
             headers = dict(stream_headers)
             is_special_cdn = is_special_cdn_stream(segment_url)
 
@@ -477,15 +649,18 @@ class HLSProxyStreamingMixin:
                 elif key.lower() == "cookie":
                     headers["Cookie"] = headers.pop(key)
 
-            # Pass through range and validation headers from client
+            # Image-wrapped segments must be fetched whole: a partial PNG
+            # cannot be unwrapped and would be dropped as 204, stalling iOS
+            # players that probe with a byte range.
+            image_segment = self._is_image_url(segment_url)
             for header in ["range", "if-none-match", "if-modified-since"]:
-                if header in request.headers:
+                if header in request.headers and not (header == "range" and image_segment):
                     headers[header] = request.headers[header]
 
             # DASH SegmentList relays carry the source byte-range in the
             # generated URL. Forward it when the player sends no Range header.
             source_range = request.query.get("range")
-            if source_range and re.fullmatch(r"\d+-\d+", source_range):
+            if source_range and not image_segment and re.fullmatch(r"\d+-\d+", source_range):
                 headers["Range"] = f"bytes={source_range}"
 
             # Media segments must not be content-encoded in transit.  aiohttp
@@ -571,9 +746,12 @@ class HLSProxyStreamingMixin:
 
                 for header in [
                     "content-type",
-                    "content-length",
-                    "content-range",
-                    "accept-ranges",
+                    # Canonical casing: Samsung AVPlay matches these names
+                    # case-sensitively and ignores lowercase Content-Range,
+                    # so non-faststart MP4s never seek to their moov box.
+                    "Content-Length",
+                    "Content-Range",
+                    "Accept-Ranges",
                     "last-modified",
                     "etag",
                 ]:
@@ -706,6 +884,8 @@ class HLSProxyStreamingMixin:
                     if first_chunk:
                         await self._write_with_backpressure(response, first_chunk)
                     async for chunk in stream_iter:
+                        if self._client_gone(request):
+                            return response
                         await self._write_with_backpressure(response, chunk)
                     await response.write_eof()
                     return response
@@ -746,6 +926,59 @@ class HLSProxyStreamingMixin:
             )
             return web.Response(text=f"Segment error: {str(e)}", status=500)
 
+    @staticmethod
+    def _loopback_base(request) -> str:
+        sockname = request.transport.get_extra_info("sockname") if request.transport else None
+        port = sockname[1] if sockname else int(os.environ.get("PORT", "7860"))
+        return f"http://127.0.0.1:{port}"
+
+    async def _waf_impersonation_works(self, stream_url, headers, session_proxy, disable_ssl) -> bool:
+        """One-shot check: does the same request pass with a browser TLS fingerprint?
+
+        Some Cloudflare-fronted hosts answer 403 to aiohttp (JA3/JA4) regardless
+        of WARP, but 200 to curl_cffi impersonation. On success the caller
+        remembers the host, so following manifests/segments skip aiohttp.
+        """
+        session_cls = get_curl_async_session()
+        if session_cls is None:
+            return False
+        curl_kwargs = {"impersonate": "chrome124"}
+        curl_options = _config.get_curl_ipv4_options(session_proxy).get("curl_options")
+        if curl_options:
+            curl_kwargs["curl_options"] = curl_options
+        curl_s = None
+        try:
+            curl_s = session_cls(**curl_kwargs)
+            resp = await curl_s.get(
+                final_curl_request_url(stream_url),
+                headers=prepare_curl_headers(stream_url, headers),
+                proxies={"http": session_proxy, "https": session_proxy} if session_proxy else None,
+                verify=not disable_ssl,
+                timeout=15,
+                stream=True,
+                allow_redirects=True,
+            )
+            try:
+                return resp.status_code in (200, 206)
+            finally:
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.debug(
+                "Impersonation probe failed for %s: %s",
+                stream_url,
+                exc,
+            )
+            return False
+        finally:
+            if curl_s is not None:
+                try:
+                    await curl_s.close()
+                except Exception:
+                    pass
+
     async def _proxy_stream(self, request, stream_url, stream_headers, bypass_warp=None, forced_proxy=None, force_direct=None, extractor_key=None, stream_key=None):
         """Effettua il proxy dello stream con gestione manifest e AES-128"""
         is_hls_segment_request = request.path.startswith("/proxy/hls/segment.")
@@ -755,6 +988,26 @@ class HLSProxyStreamingMixin:
                 raise ValueError()
         except ValueError:
             return web.Response(status=400, text="Invalid DUAL video track")
+        is_dual_prefetch = request.headers.get(dual_prefetch.PREFETCH_HEADER) == "1"
+        if dual_video_track and is_hls_segment_request and not is_dual_prefetch:
+            segment_key = request.query.get("d", "")
+            cached_segment = await dual_prefetch.lookup(segment_key, dual_video_track)
+            if cached_segment is not None:
+                body, status, content_range = byte_range(cached_segment, request.headers.get("Range"))
+                cached_headers = {
+                    "Content-Type": "video/mp4",
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(len(body)),
+                    "Cache-Control": "no-transform",
+                    "Content-Encoding": "identity",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                    "Access-Control-Allow-Headers": "Range, Content-Type",
+                }
+                if content_range:
+                    cached_headers["Content-Range"] = content_range
+                dual_prefetch.schedule_after(segment_key, dual_video_track, self._loopback_base(request))
+                return web.Response(body=body, status=status, headers=cached_headers)
         if bypass_warp is None:
             bypass_warp = request.query.get("warp", "").lower() == "off"
         bypass_proxies = request.query.get("proxy", "").lower() == "off"
@@ -808,11 +1061,6 @@ class HLSProxyStreamingMixin:
         coalesce_future = None
 
         try:
-            self._touch_extractor_activity(
-                extractor_key,
-                stream_key,
-            )
-
             # ✅ LIVE CDN TOKEN SUBSTITUTION: If the CDN token was refreshed via
             # re-extract on 403, replace the old base URL with the new one so every
             # subsequent segment gets a fresh token without re-extracting each time.
@@ -846,8 +1094,9 @@ class HLSProxyStreamingMixin:
 
             # Passa attraverso alcuni headers del client, ma FILTRA quelli che potrebbero leakare l'IP
             # Rimuoviamo specificamente i condizionali che possono causare 412/416 con URL dinamici
+            image_segment = self._is_image_url(stream_url)
             for header in ["range", "if-none-match", "if-modified-since"]:
-                if header in request.headers:
+                if header in request.headers and not (header == "range" and image_segment):
                     headers[header] = request.headers[header]
 
             # ✅ FIX: Esplicita rimozione di If-Match e If-Range che spesso causano 416 su CDNs dinamici
@@ -938,6 +1187,16 @@ class HLSProxyStreamingMixin:
             if is_special_cdn:
                 headers["Accept-Encoding"] = "identity"
 
+            if is_hls_segment_request:
+                self._schedule_cdn_token_refresh(
+                    request.query.get("orig_url"),
+                    stream_url,
+                    headers,
+                    bypass_warp,
+                    forced_proxy,
+                    stream_key,
+                )
+
             if is_hls_segment_request and self._segment_coalesce_eligible(request):
                 coalesce_key = (self._segment_coalesce_key(stream_url, headers), dual_video_track)
                 inflight = self._segment_inflight_map()
@@ -947,7 +1206,14 @@ class HLSProxyStreamingMixin:
                         "Segment coalesce: waiting for in-flight fetch [%s]",
                         log_context(),
                     )
-                    shared = await asyncio.shield(pending)
+                    try:
+                        shared = await asyncio.wait_for(
+                            asyncio.shield(pending), timeout=3.0
+                        )
+                    except asyncio.TimeoutError:
+                        # The in-flight fetch is slow: do not queue this retry
+                        # behind it, start an independent fetch.
+                        shared = None
                     if shared is not None:
                         shared_body, shared_headers = shared
                         return web.Response(
@@ -955,6 +1221,8 @@ class HLSProxyStreamingMixin:
                             status=200,
                             headers=dict(shared_headers),
                         )
+                    if self._client_gone(request):
+                        return web.Response(status=499, text="Client disconnected")
                 coalesce_future = asyncio.get_running_loop().create_future()
                 inflight[coalesce_key] = coalesce_future
 
@@ -1005,6 +1273,7 @@ class HLSProxyStreamingMixin:
             # it dies. Refresh it here, with the session that fetches the
             # playlist, so the token matches this egress address.
             from extractors.dlstreams import (
+                decrypt_premium_playlist,
                 ensure_premium_playlist_url,
                 invalidate_premium_playlist_token,
                 premium_playlist_parts,
@@ -1065,10 +1334,9 @@ class HLSProxyStreamingMixin:
                 is_special_cdn,
                 HAS_CURL_CFFI,
             )
-            # ✅ FIX BUFFERING: Use generous sock_read for segments via slow proxies.
-            # sock_read=None prevents SocketTimeoutError mid-transfer on large 1080p
-            # segments; the total timeout still caps the overall request duration.
-            segment_timeout = ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=None)
+            # Bounded read gap: a stalled CDN connection aborts in 10s instead
+            # of hanging until the total timeout (players retry well before).
+            segment_timeout = ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=10)
 
             if use_curl_cffi:
                 logger.info(
@@ -1302,6 +1570,36 @@ class HLSProxyStreamingMixin:
 
                 if resp.status not in [200, 206]:
                     if resp.status == 403:
+                        # Cloudflare can reject aiohttp's TLS fingerprint even
+                        # through WARP. Probe once with browser impersonation;
+                        # on success the host is remembered so its segments and
+                        # later manifests go straight to curl_cffi.
+                        if (
+                            HAS_CURL_CFFI
+                            and not use_curl_cffi
+                            and not is_special_cdn
+                            and not host_needs_impersonation(stream_url)
+                        ):
+                            waf_host = urllib.parse.urlsplit(stream_url).hostname or stream_url
+                            if await self._waf_impersonation_works(
+                                stream_url, headers, session_proxy, disable_ssl
+                            ):
+                                remember_impersonation_host(stream_url)
+                                logger.info(
+                                    "🕵️ WAF TLS block bypassed for %s with browser impersonation, retrying [%s]",
+                                    waf_host,
+                                    log_context(session_proxy),
+                                )
+                                return await self._proxy_stream(
+                                    request,
+                                    stream_url,
+                                    stream_headers,
+                                    bypass_warp=bypass_warp,
+                                    forced_proxy=forced_proxy,
+                                    force_direct=force_direct,
+                                    extractor_key=extractor_key,
+                                    stream_key=stream_key,
+                                )
                         # 1. Quick retry if it's a transient CDN error (e.g. Varnish cache miss with Retry-After on TikTok/live CDNs)
                         if is_hls_segment_request:
                             retry_after = resp.headers.get("Retry-After")
@@ -1497,8 +1795,11 @@ class HLSProxyStreamingMixin:
                         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
                         "Access-Control-Allow-Headers": "Range, Content-Type",
                     }
-                    for h in ["content-length", "content-range", "accept-ranges"]:
+                    for h in ["Content-Length", "Content-Range", "Accept-Ranges"]:
                         if h in resp.headers: response_headers[h] = resp.headers[h]
+                    # See the buffered path: keep segments uncompressed end to end.
+                    response_headers["Cache-Control"] = "no-transform"
+                    response_headers["Content-Encoding"] = "identity"
 
                     response = web.StreamResponse(status=resp.status, headers=response_headers)
                     await response.prepare(request)
@@ -1577,6 +1878,8 @@ class HLSProxyStreamingMixin:
 
                 if manifest_content:
                     logger.info(f"📄 HLS manifest detected: {stream_url}")
+                    if is_premium_manifest:
+                        manifest_content = decrypt_premium_playlist(manifest_content, stream_url)
                     proxy_base = get_public_base_url(request)
                     original_url = request.query.get("orig_url") or request.query.get("url") or request.query.get("d", "")
                     use_short_hls_urls = should_use_short_manifest_urls(
@@ -1594,7 +1897,6 @@ class HLSProxyStreamingMixin:
                         stream_headers=headers,
                         original_channel_url=original_url,
                         api_password=request.query.get("api_password"),
-                        get_extractor_func=self.get_extractor,
                         no_bypass=request.query.get("no_bypass") == "1",
                         shorten_url_func=self.shorten_hls_url if use_short_hls_urls else None,
                         bypass_warp=bypass_warp,
@@ -1706,7 +2008,6 @@ class HLSProxyStreamingMixin:
                             pass
 
                     # --- DEFAULT: DASH Proxy (Rewriting) ---
-                    req_format = request.query.get("format")
                     rep_id = request.query.get("rep_id")
 
                     api_password = request.query.get("api_password")
@@ -1763,14 +2064,22 @@ class HLSProxyStreamingMixin:
                     except ValueError as exc:
                         logger.warning("DUAL video filtering failed: %s", exc)
                         return web.Response(status=502, text="Invalid DUAL fMP4 segment", headers={"Access-Control-Allow-Origin": "*"})
+                    if is_hls_segment_request and response_status == 200:
+                        segment_key = request.query.get("d", "")
+                        dual_prefetch.store(segment_key, dual_video_track, content_bytes)
+                        if not is_dual_prefetch:
+                            dual_prefetch.schedule_after(segment_key, dual_video_track, self._loopback_base(request))
 
                 response_headers = {}
 
                 for header in [
                     "content-type",
-                    "content-length",
-                    "content-range",
-                    "accept-ranges",
+                    # Canonical casing: Samsung AVPlay matches these names
+                    # case-sensitively and ignores lowercase Content-Range,
+                    # so non-faststart MP4s never seek to their moov box.
+                    "Content-Length",
+                    "Content-Range",
+                    "Accept-Ranges",
                     "last-modified",
                     "etag",
                 ]:
@@ -1838,6 +2147,12 @@ class HLSProxyStreamingMixin:
                 set_response_header(
                     response_headers, "Content-Length", str(len(content_bytes))
                 )
+                # The reverse proxy (Traefik gzip) compresses full responses and
+                # Cloudflare caches that copy, then answers Range requests with
+                # the compressed size in Content-Range, truncating init segments.
+                # Traefik skips responses that already declare an encoding.
+                set_response_header(response_headers, "Cache-Control", "no-transform")
+                set_response_header(response_headers, "Content-Encoding", "identity")
 
                 if coalesce_future is not None and response_status == 200:
                     coalesce_future.set_result(
@@ -2010,16 +2325,8 @@ class HLSProxyStreamingMixin:
             orig_url,
         )
         try:
-            extractor = await self.get_extractor(orig_url, headers, bypass_warp=bypass_warp)
-            if not extractor:
-                return None
-
-            refreshed = await extractor.extract(
-                orig_url,
-                force_refresh=True,
-                request_headers=headers,
-                bypass_warp=bypass_warp,
-                proxy=forced_proxy,
+            refreshed = await self._extract_refreshed(
+                orig_url, headers, bypass_warp, forced_proxy
             )
             if not refreshed or not refreshed.get("destination_url"):
                 return None
@@ -2034,16 +2341,36 @@ class HLSProxyStreamingMixin:
 
             # Update live CDN token for stream_key so segments get the fresh token
             if stream_key:
-                old_base_dir = stream_url.rsplit("/", 1)[0] + "/"
-                new_base_dir = new_stream_url.rsplit("/", 1)[0] + "/"
-                new_qs = ""
-                if "?" in new_stream_url:
-                    new_qs = "?" + new_stream_url.split("?", 1)[1]
-                self._renewed_cdn_tokens[stream_key] = (old_base_dir, new_base_dir, new_qs)
-                self._renewed_cdn_token_atimes[stream_key] = time.time()
-                logger.info(
-                    "🔑 Updated CDN token for stream_key=%s via manifest refresh",
-                    stream_key[:8],
+                self._store_cdn_token(
+                    stream_key,
+                    stream_url,
+                    new_stream_url,
+                    "Updated CDN token via manifest refresh",
+                )
+
+            # Signed provider URLs (e.g. Vavoo) expire. Send the player to a
+            # fresh stable manifest URL so it stops retrying the expired one.
+            if "manifest.m3u8" in request.path and new_stream_url != stream_url:
+                query = {"d": new_stream_url}
+                for key, value in (new_headers or {}).items():
+                    query[f"h_{key}"] = str(value)
+                for name in (
+                    "api_password", "disable_ssl", "warp", "proxy", "direct",
+                ):
+                    value = request.query.get(name)
+                    if value:
+                        query[name] = value
+                if refreshed.get("disable_ssl") or (new_headers or {}).get("X-EasyProxy-Disable-SSL") == "1":
+                    query["disable_ssl"] = "1"
+                if extractor_key:
+                    query["extractor_key"] = extractor_key
+                if stream_key:
+                    query["stream_key"] = stream_key
+                query["orig_url"] = orig_url
+                logger.info("↪️ [Manifest Refresh] Redirecting to fresh stable URL")
+                return web.HTTPFound(
+                    f"{get_public_base_url(request)}/proxy/hls/manifest.m3u8?"
+                    f"{urllib.parse.urlencode(query)}"
                 )
 
             return await self._proxy_stream(
@@ -2064,9 +2391,6 @@ class HLSProxyStreamingMixin:
         self, request, stream_url, headers, bypass_warp, forced_proxy, force_direct, disable_ssl
     ):
         """Re-extract the source on 403 to refresh signed CDN tokens, then retry the segment."""
-        import urllib.parse as _up
-        from services.proxy_shared import ProxyDeadRetryError
-
         orig_url = request.query.get("orig_url")
         if not orig_url:
             return None
@@ -2076,16 +2400,8 @@ class HLSProxyStreamingMixin:
             return None
 
         try:
-            extractor = await self.get_extractor(orig_url, headers, bypass_warp=bypass_warp)
-            if not extractor:
-                return None
-
-            refreshed = await extractor.extract(
-                orig_url,
-                force_refresh=True,
-                request_headers=headers,
-                bypass_warp=bypass_warp,
-                proxy=forced_proxy,
+            refreshed = await self._extract_refreshed(
+                orig_url, headers, bypass_warp, forced_proxy
             )
         except Exception as exc:
             logger.debug(
@@ -2094,42 +2410,14 @@ class HLSProxyStreamingMixin:
                 request_log_context(request, stream_url, route=safe_log_route(forced_proxy)),
             )
             return None
-        finally:
-            # Shared extractor lifecycle belongs to the registry owner.
-            pass
 
         headers = refreshed.get("request_headers") or headers
         forced_proxy = refreshed.get("selected_proxy") or forced_proxy
         force_direct = refreshed.get("force_direct", force_direct)
         bypass_warp = refreshed.get("bypass_warp", bypass_warp)
-        captured_manifests = dict(refreshed.get("captured_manifests") or {})
-        master_url = refreshed.get("destination_url")
-        master_text = refreshed.get("captured_manifest")
-        if master_text and master_url:
-            captured_manifests.setdefault(master_url, master_text)
 
-        # Find the refreshed segment URL matching the requested segment filename
         seg_filename = stream_url.rsplit("/", 1)[-1].split("?")[0]
-        fresh_url = None
-        for m_url, m_text in captured_manifests.items():
-            for line in (m_text or "").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                abs_url = _up.urljoin(m_url, line)
-                if abs_url.rsplit("/", 1)[-1].split("?")[0] == seg_filename:
-                    fresh_url = abs_url
-                    break
-            if fresh_url:
-                break
-
-        # Fallback: if fresh_url not in captured_manifests, but master_url has a new query string
-        # (e.g. for barecrop/assetrage / tokenized HLS where the query token refreshed)
-        if not fresh_url and master_url and "?" in master_url:
-            new_q = master_url.split("?", 1)[1]
-            fresh_url = stream_url.split("?", 1)[0] + "?" + new_q
-            logger.info("Re-extract: updated segment token from playlist URL for %s", seg_filename)
-
+        fresh_url = self._fresh_segment_url(refreshed, seg_filename, stream_url)
         if not fresh_url or fresh_url.rsplit("/", 1)[-1].split("?")[0] != seg_filename:
             logger.debug(
                 "Re-extract: could not locate %s in refreshed manifest [%s]",
@@ -2205,14 +2493,12 @@ class HLSProxyStreamingMixin:
                 # segments use the new token without re-extracting each time.
                 stream_key = request.query.get("stream_key")
                 if stream_key:
-                    old_base_dir = stream_url.rsplit("/", 1)[0] + "/"
-                    new_base_dir = fresh_url.rsplit("/", 1)[0] + "/"
-                    new_qs = ""
-                    if "?" in fresh_url:
-                        new_qs = "?" + fresh_url.split("?", 1)[1]
-                    self._renewed_cdn_tokens[stream_key] = (old_base_dir, new_base_dir, new_qs)
-                    self._renewed_cdn_token_atimes[stream_key] = time.time()
-                    logger.info("🔑 CDN token saved for stream_key=%s — subsequent segments skip re-extract", stream_key[:8])
+                    self._store_cdn_token(
+                        stream_key,
+                        stream_url,
+                        fresh_url,
+                        "CDN token saved; subsequent segments skip re-extract",
+                    )
 
                 return web.Response(body=body, status=fr_resp.status, headers=rh)
         except Exception as exc:
