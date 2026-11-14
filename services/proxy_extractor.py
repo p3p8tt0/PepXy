@@ -114,6 +114,7 @@ class HLSProxyExtractorHandlerMixin:
                         "vixcloud (alias of vixsrc)",
                         "ads",
                         "sportsonline",
+                        "tvizle",
                         "mixdrop",
                         "voe",
                         "streamtape",
@@ -144,6 +145,9 @@ class HLSProxyExtractorHandlerMixin:
                         "raiplay",
                         "cinejoy",
                         "fctv33",
+                        "scorezone",
+                        "matchora",
+                        "htsport",
                     ],
                     "examples": [
                         f"{get_public_base_url(request)}/extractor/video?d=https://vavoo.to/channel/123",
@@ -151,6 +155,10 @@ class HLSProxyExtractorHandlerMixin:
                         f"{get_public_base_url(request)}/extractor/video.m3u8?host=vavoo&d=https://custom-link.com",
                         f"{get_public_base_url(request)}/extractor/video.mp4?host=mixdrop&d=https://mixdrop.co/e/ABC123XYZ",
                         f"{get_public_base_url(request)}/extractor/video?host=fctv33&d=https://fctv33.stream/match/123/stream/456",
+                        f"{get_public_base_url(request)}/extractor/video.m3u8?host=scorezone&d=https://scorezonetv.live/iptv/CHANNEL_ID",
+                        f"{get_public_base_url(request)}/extractor/video.m3u8?host=htsport&d=https://htsport.info/calciohd.htm",
+                        f"{get_public_base_url(request)}/extractor/video.m3u8?host=matchora&d=https://matchora.pro/embed/channel/692391",
+                        f"{get_public_base_url(request)}/extractor/video?host=tvizle&d=https://tvizle.tr/izle/trt-1",
                         f"{get_public_base_url(request)}/extractor/video?d=BASE64_STRING",
                     ],
                 }

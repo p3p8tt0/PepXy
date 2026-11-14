@@ -54,6 +54,10 @@ _MODULES = (
     ),
     ("extractors.cinejoy", ("CinejoyExtractor",)),
     ("extractors.fctv33", ("Fctv33Extractor",)),
+    ("extractors.scorezone", ("ScoreZoneExtractor",)),
+    ("extractors.matchora", ("MatchoraExtractor",)),
+    ("extractors.htsport", ("HTSportExtractor",)),
+    ("extractors.tvizle", ("TVizleExtractor",)),
 )
 
 # Stand-ins used when extractors.ads is unavailable, so the ADS pattern users
