@@ -1,28 +1,13 @@
 name: Sync fork with upstream
-
 on:
   schedule:
-    - cron: '0 */12 * * *'   # ogni 12 ore
-  workflow_dispatch:         # permette anche il trigger manuale
-
-permissions:
-  contents: write
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout fork
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.SYNC_TOKEN }}
-
-      - name: Add upstream remote and sync
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/realbestia1/EasyProxy.git
-          git fetch upstream
-          git merge upstream/main --no-edit
-          git push origin main
+      - run: gh repo sync ${{ github.repository }} -b main
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
