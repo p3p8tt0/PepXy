@@ -21,11 +21,13 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -122,9 +124,49 @@ _READ_ECONFIG = """
 """
 
 
+# Player already live with no gate: no POST /turnstile/ ever arrives, the URL is
+# in the DOM, in the player object or already in the resource timing.
+_READ_STREAM_URL = """
+(() => {
+  try {
+    const v = document.querySelector('video');
+    const cands = [];
+    if (v) { cands.push(v.currentSrc, v.src); }
+    const pick = (obj) => {
+      if (!obj) return;
+      const opts = obj.options || obj.config || {};
+      cands.push(opts.source, opts.file, opts.src, obj.src);
+    };
+    pick(window.player); pick(window.clapprPlayer); pick(window.jwplayer); pick(window.__player);
+    const entries = performance.getEntriesByType('resource') || [];
+    for (const e of entries) if (/\\.m3u8(\\?|$)/i.test(e.name)) cands.push(e.name);
+    const hit = cands.find(u => typeof u === 'string' && /^https?:/.test(u) && /\\.m3u8(\\?|$)/i.test(u));
+    return hit || null;
+  } catch (e) { return null; }
+})()
+"""
+
+
 def _is_stale_session(exc: Exception) -> bool:
     """True when a CDP call targets a detached iframe session."""
     return "session with given id not found" in str(exc).lower()
+
+
+def _host_of(url: str) -> str:
+    return (urlparse(url or "").hostname or "").lower()
+
+
+def _is_player_target(info: dict, host: str) -> bool:
+    """True when a child target is the player iframe of ``host``.
+
+    Loading the player URL directly makes Chrome send ``Sec-Fetch-Site: none``
+    and the player bounces to xstream.to: the parent page must open it as a
+    cross-site OOPIF instead, and that is the target to drive.
+    """
+    if not host or info.get("type") != "iframe":
+        return False
+    target_host = _host_of(info.get("url") or "")
+    return bool(target_host) and target_host == host
 
 
 def find_chrome() -> str | None:
@@ -204,17 +246,73 @@ def find_chrome() -> str | None:
     return None
 
 
-def _profile_dir() -> str:
-    """Persistent Chromium profile: cookies/clearance survive across solves."""
-    override = os.getenv("TURNSTILE_PROFILE_DIR", "").strip()
-    path = override or os.path.join(config_store.CONFIG_DIR, "turnstile-profile")
-    os.makedirs(path, exist_ok=True)
+def _clean_profile(path: str) -> None:
+    """Drop the lock/port files a dead Chromium leaves behind."""
     for name in ("SingletonLock", "SingletonSocket", "SingletonCookie", "DevToolsActivePort"):
         try:
             os.unlink(os.path.join(path, name))
         except OSError:
             pass
+
+
+def _kill_profile_chrome(profile: str) -> None:
+    """Kill a leftover Chromium still holding ``profile`` (it blocks the new one)."""
+    if os.name != "nt":
+        try:
+            killed = subprocess.run(
+                ["pkill", "-f", f"user-data-dir={profile}"],
+                timeout=5,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode == 0
+        except Exception as e:
+            logger.debug("Turnstile solver: pkill failed: %r", e)
+            return
+        if killed:
+            # Give it a moment to release the Singleton files.
+            time.sleep(0.5)
+        return
+    try:
+        import psutil
+    except Exception as e:
+        logger.debug("Turnstile solver: psutil unavailable: %r", e)
+        return
+    needle = f"user-data-dir={profile}".lower()
+    for proc in psutil.process_iter(["name", "cmdline"]):
+        name = (proc.info.get("name") or "").lower()
+        if name not in ("chrome.exe", "msedge.exe"):
+            continue
+        if not any(needle in str(arg).lower() for arg in proc.info.get("cmdline") or []):
+            continue
+        try:
+            proc.kill()
+            logger.info("Turnstile solver: killed leftover %s (pid %s)", name, proc.pid)
+        except Exception as e:
+            logger.debug("Turnstile solver: kill %s failed: %r", name, e)
+
+
+def _profile_dir() -> str:
+    """Persistent Chromium profile: cookies/clearance survive across solves."""
+    override = os.getenv("TURNSTILE_PROFILE_DIR", "").strip()
+    path = override or os.path.join(config_store.CONFIG_DIR, "turnstile-profile")
+    os.makedirs(path, exist_ok=True)
+    _clean_profile(path)
     return path
+
+
+def _chrome_log_tail(path: str, lines: int = 10) -> str:
+    """Last lines of the Chrome stderr log, for DevToolsActivePort failures."""
+    try:
+        with open(path, "rb") as fh:
+            try:
+                fh.seek(-8192, os.SEEK_END)
+            except OSError:
+                fh.seek(0)
+            raw = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    tail = " | ".join(raw.splitlines()[-lines:]).strip()
+    return tail[-800:]
 
 
 def _stop_xvfb() -> None:
@@ -231,6 +329,26 @@ def _stop_xvfb() -> None:
     _XVFB_PROCESS = None
 
 
+def _display_alive(display: str) -> bool:
+    """True when the X socket of ``display`` accepts a connection.
+
+    A socket file outlives a crashed Xvfb: connecting is the only check that
+    tells a live server from a stale one.
+    """
+    if not hasattr(socket, "AF_UNIX"):
+        return True
+    number = display.lstrip(":").split(".")[0]
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(0.5)
+    try:
+        sock.connect(f"/tmp/.X11-unix/X{number}")
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
 async def _ensure_display() -> str | None:
     """Display for headed Chromium: existing X11, or a private Xvfb."""
     global _XVFB_PROCESS, _XVFB_DISPLAY
@@ -243,27 +361,44 @@ async def _ensure_display() -> str | None:
         return existing
     async with _XVFB_LOCK:
         if _XVFB_DISPLAY:
-            return _XVFB_DISPLAY
+            if _XVFB_PROCESS is not None and _XVFB_PROCESS.poll() is None:
+                return _XVFB_DISPLAY
+            # Xvfb died: DISPLAY would point at a dead server and Chrome would
+            # exit before writing DevToolsActivePort.
+            logger.warning(
+                "Turnstile solver: Xvfb on %s is gone, restarting", _XVFB_DISPLAY
+            )
+            _XVFB_PROCESS = None
+            _XVFB_DISPLAY = None
         xvfb = shutil.which("Xvfb")
         if not xvfb:
             return None
         for number in range(99, 105):
             display = f":{number}"
             if os.path.exists(f"/tmp/.X11-unix/X{number}"):
-                _XVFB_DISPLAY = display
-                return display
+                if _display_alive(display):
+                    _XVFB_DISPLAY = display
+                    return display
+                logger.debug(
+                    "Turnstile solver: stale X socket on %s, skipping", display
+                )
+                continue
             proc = subprocess.Popen(
                 [xvfb, display, "-screen", "0", "1280x800x24", "-nolisten", "tcp"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
             await asyncio.sleep(0.5)
-            if proc.poll() is None:
+            if proc.poll() is None and _display_alive(display):
                 _XVFB_PROCESS = proc
                 _XVFB_DISPLAY = display
                 atexit.register(_stop_xvfb)
                 logger.info("Turnstile solver: started Xvfb on %s", display)
                 return display
+            try:
+                proc.kill()
+            except OSError:
+                pass
         return None
 
 
@@ -314,18 +449,28 @@ class _CDP:
 
 
 async def solve_player_stream(
-    page_url: str, proxy: str | None = None, timeout: float = 45.0
+    page_url: str,
+    proxy: str | None = None,
+    timeout: float = 45.0,
+    parent_url: str | None = None,
 ) -> dict | None:
-    """Load ``page_url``, solve the player Turnstile gate, return the POST body."""
+    """Load the player page, solve its Turnstile gate, return the POST body.
+
+    ``parent_url`` is the page that embeds ``page_url`` as an iframe: passing it
+    lets the iframe load with the Referer/Sec-Fetch-Site it expects.
+    """
     try:
-        return await _solve(page_url, proxy, timeout, mode="stream")
+        return await _solve(page_url, proxy, timeout, mode="stream", parent_url=parent_url)
     except Exception as e:
         logger.warning("Turnstile solver: failed for %s: %r", page_url, e)
         return None
 
 
 async def solve_premium_ticket(
-    page_url: str, proxy: str | None = None, timeout: float = 45.0
+    page_url: str,
+    proxy: str | None = None,
+    timeout: float = 45.0,
+    parent_url: str | None = None,
 ) -> dict | None:
     """Solve the premium player Turnstile and return its playlist ticket.
 
@@ -334,18 +479,26 @@ async def solve_premium_ticket(
     answers for the address that holds the ticket.
     """
     try:
-        return await _solve(page_url, proxy, timeout, mode="premium")
+        return await _solve(
+            page_url, proxy, timeout, mode="premium", parent_url=parent_url
+        )
     except Exception as e:
         logger.warning("Turnstile solver: premium failed for %s: %r", page_url, e)
         return None
 
 
 async def _solve(
-    page_url: str, proxy: str | None, timeout: float, mode: str = "stream"
+    page_url: str,
+    proxy: str | None,
+    timeout: float,
+    mode: str = "stream",
+    parent_url: str | None = None,
 ) -> dict | None:
     async with _SOLVE_LOCK:
         for attempt in (1, 2):
-            solution = await _solve_once(page_url, proxy, min(timeout, 30.0), mode)
+            solution = await _solve_once(
+                page_url, proxy, min(timeout, 30.0), mode, parent_url
+            )
             if solution:
                 return solution
             logger.info(
@@ -400,6 +553,10 @@ async def launch_browser(
             env["DISPLAY"] = display
 
     profile = _profile_dir()
+    # A previous Chrome can stay alive and keep the profile locked, which makes
+    # the new one exit before writing DevToolsActivePort.
+    _kill_profile_chrome(profile)
+    _clean_profile(profile)
     ua = _build_user_agent(chrome)
     cmd = [chrome]
     if headless:
@@ -435,17 +592,33 @@ async def launch_browser(
     cmd.append("about:blank")
     logger.debug("%s: launching (headless=%s): %s", label, headless, " ".join(cmd[:6]))
 
+    # Chrome's stderr explains an early exit (profile lock, dead DISPLAY).
+    log_path = os.path.join(config_store.CONFIG_DIR, "chrome-solver.log")
+    log = subprocess.DEVNULL
+    try:
+        os.makedirs(config_store.CONFIG_DIR, exist_ok=True)
+        log = open(log_path, "ab")
+    except OSError as e:
+        logger.debug("%s: cannot open %s: %r", label, log_path, e)
+
     proc = subprocess.Popen(
         cmd,
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
+    if log is not subprocess.DEVNULL:
+        log.close()
     try:
         port = await _wait_devtools_port(profile)
         if not port:
-            logger.warning("%s: DevToolsActivePort not written", label)
+            tail = _chrome_log_tail(log_path)
+            logger.warning(
+                "%s: DevToolsActivePort not written%s",
+                label,
+                f" (chrome log: {tail})" if tail else "",
+            )
             raise RuntimeError("DevToolsActivePort not written")
 
         version = await asyncio.to_thread(_read_devtools_version, port)
@@ -464,7 +637,11 @@ async def launch_browser(
 
 
 async def _solve_once(
-    page_url: str, proxy: str | None, timeout: float, mode: str = "stream"
+    page_url: str,
+    proxy: str | None,
+    timeout: float,
+    mode: str = "stream",
+    parent_url: str | None = None,
 ) -> dict | None:
     launched = await launch_browser(proxy=proxy)
     if not launched:
@@ -475,7 +652,7 @@ async def _solve_once(
             async with session.ws_connect(
                 version["webSocketDebuggerUrl"], max_msg_size=0
             ) as ws:
-                return await _drive(ws, page_url, timeout, ua, mode)
+                return await _drive(ws, page_url, timeout, ua, mode, parent_url)
     finally:
         try:
             proc.terminate()
@@ -527,8 +704,19 @@ async def _response_json(cdp, request_id, session_id) -> dict | None:
 
 
 async def _drive(
-    ws, page_url: str, timeout: float, ua: str, mode: str = "stream"
+    ws,
+    page_url: str,
+    timeout: float,
+    ua: str,
+    mode: str = "stream",
+    parent_url: str | None = None,
 ) -> dict | None:
+    """Drive one solve attempt.
+
+    With ``parent_url`` the browser opens the page embedding the player and lets
+    the iframe load as a cross-site OOPIF (correct Referer and Sec-Fetch-Site);
+    navigating straight to ``page_url`` makes the player bounce to xstream.to.
+    """
     cdp = _CDP(ws)
     try:
         target = await cdp.send("Target.createTarget", {"url": "about:blank"})
@@ -555,12 +743,43 @@ async def _drive(
             {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
             sid,
         )
-        await cdp.send("Page.navigate", {"url": page_url}, sid)
+        iframe_host = _host_of(page_url) if parent_url else ""
+        child_sessions: dict[str, str] = {}
+
+        async def _enable_child(child_sid: str) -> None:
+            # Runtime.enable is a known CDP detection vector; evaluate works
+            # without it.
+            for domain in ("Network.enable", "Page.enable", "Log.enable"):
+                try:
+                    await cdp.send(domain, {}, child_sid)
+                except Exception as e:
+                    logger.debug("Turnstile solver: %s failed: %r", domain, e)
+            try:
+                await cdp.send(
+                    "Emulation.setFocusEmulationEnabled", {"enabled": True}, child_sid
+                )
+            except Exception as e:
+                logger.debug("Turnstile solver: focus emulation failed: %r", e)
+
+        if parent_url:
+            # The OOPIF is reported before it navigates: discovery lets us
+            # attach to the player iframe itself.
+            try:
+                await cdp.send("Target.setDiscoverTargets", {"discover": True})
+            except Exception as e:
+                logger.debug("Turnstile solver: setDiscoverTargets failed: %r", e)
+        await cdp.send("Page.navigate", {"url": parent_url or page_url}, sid)
 
         deadline = time.monotonic() + timeout
+        # No player iframe in the parent page (~10s): play it as a top document.
+        direct_nav_at = time.monotonic() + 10
+        direct_nav_done = False
+        player_seen = False
         iframe_sid = None
         clicks = 0
         next_probe = time.monotonic() + 3
+        # A live player may never POST /turnstile/: read its URL instead.
+        next_fallback = time.monotonic() + 9
         actual_ua = None
         server_date = None
         challenge_urls: dict[str, str] = {}
@@ -580,26 +799,49 @@ async def _drive(
                     url = params.get("request", {}).get("url", "")
                     if "challeng" in url or "turnstile" in url:
                         challenge_urls[params.get("requestId")] = url
-                elif method == "Target.attachedToTarget":
+                elif method in ("Target.attachedToTarget", "Target.targetCreated"):
                     info = params.get("targetInfo", {})
+                    tid = info.get("targetId") or ""
                     new_sid = params.get("sessionId")
-                    if not new_sid:
+                    if info.get("type") not in ("iframe", "page"):
                         continue
-                    if info.get("type") in ("iframe", "page"):
-                        iframe_sid = new_sid if info.get("type") == "iframe" else iframe_sid
-                        # Runtime.enable is a known CDP detection vector; evaluate
-                        # works without it.
-                        for domain in ("Network.enable", "Page.enable", "Log.enable"):
-                            try:
-                                await cdp.send(domain, {}, new_sid)
-                            except Exception as e:
-                                logger.debug("Turnstile solver: %s failed: %r", domain, e)
+                    if method == "Target.targetCreated":
+                        if not tid or tid in child_sessions:
+                            continue
+                        if not _is_player_target(info, iframe_host):
+                            continue
                         try:
-                            await cdp.send(
-                                "Emulation.setFocusEmulationEnabled", {"enabled": True}, new_sid
+                            attached_child = await cdp.send(
+                                "Target.attachToTarget",
+                                {"targetId": tid, "flatten": True},
                             )
                         except Exception as e:
-                            logger.debug("Turnstile solver: focus emulation failed: %r", e)
+                            logger.debug(
+                                "Turnstile solver: player target attach failed: %r", e
+                            )
+                            continue
+                        new_sid = attached_child.get("sessionId")
+                    if not new_sid:
+                        continue
+                    if tid:
+                        child_sessions[tid] = new_sid
+                    # The POST/JSON the gate releases arrives on this session.
+                    await _enable_child(new_sid)
+                    if info.get("type") == "iframe" and (
+                        not parent_url
+                        or iframe_sid is None
+                        or _is_player_target(info, iframe_host)
+                    ):
+                        iframe_sid = new_sid
+                    if _is_player_target(info, iframe_host):
+                        player_seen = True
+                elif method == "Target.targetInfoChanged":
+                    # The OOPIF often attaches before its URL is known.
+                    info = params.get("targetInfo", {})
+                    new_sid = child_sessions.get(info.get("targetId") or "")
+                    if new_sid and _is_player_target(info, iframe_host):
+                        iframe_sid = new_sid
+                        player_seen = True
                 elif method == "Network.responseReceived":
                     url = params.get("response", {}).get("url", "")
                     if esid == sid and server_date is None:
@@ -671,6 +913,20 @@ async def _drive(
                         entry.get("level"),
                         entry.get("text"),
                     )
+
+            if parent_url and not direct_nav_done and not player_seen:
+                if time.monotonic() >= direct_nav_at:
+                    direct_nav_done = True
+                    logger.info(
+                        "Turnstile solver: no player iframe in %s, navigating directly",
+                        parent_url,
+                    )
+                    try:
+                        await cdp.send("Page.navigate", {"url": page_url}, sid)
+                    except Exception as e:
+                        logger.debug(
+                            "Turnstile solver: direct navigation failed: %r", e
+                        )
 
             if iframe_sid and time.monotonic() >= next_probe:
                 next_probe = time.monotonic() + 3
@@ -760,6 +1016,38 @@ async def _drive(
                         logger.info(
                             "Turnstile solver: clicked widget (%d/4)", clicks
                         )
+
+            if mode == "stream" and time.monotonic() >= next_fallback:
+                next_fallback = time.monotonic() + 2
+                # Ungated player: it starts on its own and the signed URL is
+                # already there, so no POST /turnstile/ will ever arrive. Probe
+                # the player session(s) first, then the top document.
+                candidates = [iframe_sid] + list(child_sessions.values()) + [sid]
+                for probe_sid in dict.fromkeys(s for s in candidates if s):
+                    try:
+                        res = await cdp.send(
+                            "Runtime.evaluate",
+                            {"expression": _READ_STREAM_URL, "returnByValue": True},
+                            probe_sid,
+                        )
+                    except Exception as e:
+                        if _is_stale_session(e) and probe_sid == iframe_sid:
+                            iframe_sid = None
+                        logger.debug(
+                            "Turnstile solver: stream URL probe failed: %r", e
+                        )
+                        continue
+                    hit = (res.get("result", {}) or {}).get("value")
+                    if isinstance(hit, str) and hit:
+                        logger.info(
+                            "Turnstile solver: stream URL read from player (fallback)"
+                        )
+                        return {
+                            "success": True,
+                            "stream_url": hit,
+                            "stream_url_nop2p": None,
+                            "_solver_user_agent": actual_ua or ua,
+                        }
 
         if mode == "premium" and captured.get("ticket"):
             # The ticket alone is enough for the caller's own token GET.
