@@ -63,13 +63,14 @@ def _redact_extract_url(url: str) -> str:
     return text[:160]
 
 
-def _activity_start(url, extractor, client):
+def _activity_start(url, extractor, client, user_agent=""):
     rec = {
         "id": next(_EXTRACT_ACTIVITY_SEQ),
         "time": time.time(),
         "url": _redact_extract_url(url),
         "extractor": extractor or "auto",
         "client": client or "",
+        "user_agent": (user_agent or "")[:512],
         "status": "running",
         "duration_ms": None,
         "error": "",
@@ -88,13 +89,14 @@ def _activity_finish(rec, status, error=""):
     rec["error"] = (error or "")[:160]
 
 
-def _activity_backoff(url, extractor, client):
+def _activity_backoff(url, extractor, client, user_agent=""):
     rec = {
         "id": next(_EXTRACT_ACTIVITY_SEQ),
         "time": time.time(),
         "url": _redact_extract_url(url),
         "extractor": extractor or "auto",
         "client": client or "",
+        "user_agent": (user_agent or "")[:512],
         "status": "backoff",
         "duration_ms": 0,
         "error": "temporary backoff",
@@ -306,6 +308,7 @@ class HLSProxyExtractorHandlerMixin:
                         "wittytv",
                         "raiplay",
                         "cinejoy",
+                        "movy",
                         "fctv33",
                         "scorezone",
                         "matchora",
@@ -331,6 +334,7 @@ class HLSProxyExtractorHandlerMixin:
                         f"{get_public_base_url(request)}/extractor/video?host=ppv&d=https://ppv.st/live/nfl-network",
                         f"{get_public_base_url(request)}/extractor/video?host=ntv&d=https://ntv.cx/watch/raptor/ppv-31956",
                         f"{get_public_base_url(request)}/extractor/video.m3u8?host=streamcorner&d=https://streamcorner.foo/stream/channels/cnn",
+                        f"{get_public_base_url(request)}/extractor/video.m3u8?host=movy&d=https://www.movy.sx/movie/27205",
                         f"{get_public_base_url(request)}/extractor/video?d=BASE64_STRING",
                     ],
                 }
@@ -364,13 +368,21 @@ class HLSProxyExtractorHandlerMixin:
             if _extract_backoff_active(url):
                 wait = _EXTRACT_BACKOFF_UNTIL[url] - time.monotonic()
                 logger.warning("⏸️ Extractor backoff (%.0fs left) [%s]", wait, url)
-                _activity_backoff(url, host_param, _config.get_client_ip(request))
+                _activity_backoff(
+                    url,
+                    host_param,
+                    _config.get_client_ip(request),
+                    request.headers.get("User-Agent", ""),
+                )
                 return web.Response(
                     status=503,
                     text="Extractor temporarily unavailable (backoff)",
                 )
             activity = _activity_start(
-                url, host_param or "auto", _config.get_client_ip(request)
+                url,
+                host_param or "auto",
+                _config.get_client_ip(request),
+                request.headers.get("User-Agent", ""),
             )
             redirect_stream = (
                 request.query.get("redirect_stream", "false").lower() == "true"
